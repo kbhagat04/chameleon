@@ -3,6 +3,9 @@ import { useState, useEffect, useRef } from 'react'
 import { supabase } from '../lib/supabaseClient'
 import { checkSupabase } from '../lib/supabaseClient'
 
+// Theme key used in localStorage
+const THEME_KEY = 'chameleon_dark'
+
 export default function Home() {
   // Avoid accessing localStorage during SSR — initialize to a safe default
   const [room, setRoom] = useState('main')
@@ -67,6 +70,7 @@ export default function Home() {
   const lastHandledStartRef = useRef(0)
   const [localPresence, setLocalPresence] = useState(false)
   const localPresenceRef = useRef(false)
+  const [dark, setDark] = useState(false)
 
   const normalizeRoom = (r) => (r || '').toString().trim().toLowerCase()
   const fetchPlayersRef = useRef(null)
@@ -120,6 +124,15 @@ export default function Home() {
         if (type === 'player-left' && payload?.id) {
             // fetch authoritative list from DB when a leave happens
             try { fetchPlayersRef.current && fetchPlayersRef.current(normalizeRoom(room)) } catch (e) {}
+        }
+        if (type === 'room-cleared' && payload?.room) {
+          try {
+            const canonical = normalizeRoom(payload.room)
+            if (normalizeRoom(room) === canonical) {
+              try { showAlert('Room was cleared. Returning to the home screen.') } catch (e) {}
+              try { leaveRoom() } catch (e) {}
+            }
+          } catch (e) {}
         }
       }
       return bc
@@ -175,6 +188,14 @@ export default function Home() {
   // On mount: load persisted room/player id and set up BroadcastChannel once
   useEffect(() => {
     if (typeof window === 'undefined') return
+    // initialize dark mode from localStorage
+    try {
+      const saved = localStorage.getItem(THEME_KEY)
+      if (saved === 'true') {
+        setDark(true)
+        try { document.documentElement.setAttribute('data-theme', 'dark') } catch (e) {}
+      }
+    } catch (e) {}
     try {
       const storedRoom = localStorage.getItem('chameleon_room')
       if (storedRoom) setRoom(storedRoom)
@@ -193,6 +214,17 @@ export default function Home() {
       try { bc?.close() } catch (e) {}
     }
   }, [])
+
+  // toggle dark mode and persist choice
+  const toggleDark = () => {
+    try {
+      const next = !dark
+      setDark(next)
+      if (next) document.documentElement.setAttribute('data-theme', 'dark')
+      else document.documentElement.removeAttribute('data-theme')
+      try { localStorage.setItem(THEME_KEY, next ? 'true' : 'false') } catch (e) {}
+    } catch (e) { console.error('toggleDark error', e) }
+  }
 
   // Simple in-room presence implemented via a rooms record with payload
   // Presence is now implemented using a dedicated `players` table.
@@ -525,6 +557,41 @@ export default function Home() {
     setCategory(null)
   }
 
+  // Clear the current room: remove all player rows and reset the room payload.
+  async function clearRoom() {
+    const ok = await showConfirm(`Clear room "${room}"? This will remove all players and reset the room.`, 'Clear', 'Cancel')
+    if (!ok) return
+    const normalizedRoom = normalizeRoom(room)
+    try {
+      // delete all players in the room
+      const delPlayers = await supabase.from('players').delete().eq('room', normalizedRoom)
+      if (delPlayers.error) {
+        console.error('clearRoom: delete players error', delPlayers)
+        await showAlert('Failed to clear players for the room.')
+        return
+      }
+      // delete the room payload as well
+      const delRoom = await supabase.from('rooms').delete().eq('room', normalizedRoom)
+      if (delRoom.error) {
+        console.error('clearRoom: delete room error', delRoom)
+        // continue — we already removed players
+      }
+
+      // broadcast to other tabs on the same origin
+      try {
+        const bc = setupBroadcast()
+        if (bc) bc.postMessage({ type: 'room-cleared', payload: { room: normalizedRoom } })
+      } catch (e) {}
+
+      // local UI: notify and leave
+      try { await showAlert('Room cleared — returning to home.') } catch (e) {}
+      try { leaveRoom() } catch (e) {}
+    } catch (e) {
+      console.error('clearRoom exception', e)
+      await showAlert('Failed to clear room (exception)')
+    }
+  }
+
   function chooseWord(cat, payloadCustomWords) {
     // category-aware word lists (expanded)
     const lists = {
@@ -574,6 +641,11 @@ export default function Home() {
       <div className="card">
         <h1 className="title">🦎 Chameleon</h1>
         <p className="subtitle">Social deduction game for 3+ players</p>
+        <div style={{ position: 'absolute', top: 12, right: 16 }}>
+          <button onClick={toggleDark} className="btn" style={{ padding: '8px 10px', borderRadius: '8px', fontSize: '0.85rem' }}>
+            {dark ? '🌙 Dark' : '☀️ Light'}
+          </button>
+        </div>
         
         {localPresence && (
           <div style={{ background: 'var(--warning)', color: 'white', padding: '12px', borderRadius: '8px', marginBottom: '16px', textAlign: 'center', fontWeight: 600, fontSize: '0.9rem' }}>
@@ -682,9 +754,14 @@ export default function Home() {
                 <div style={{ fontSize: '0.75rem', textTransform: 'uppercase', letterSpacing: '0.05em', color: 'var(--text-muted)', marginBottom: '4px' }}>Room</div>
                 <div style={{ fontWeight: 700, color: 'var(--text-main)', fontSize: '1.1rem' }}>{room}</div>
               </div>
-              <button onClick={leaveRoom} className="btn btn-secondary" style={{ width: 'auto', padding: '8px 16px', fontSize: '0.9rem' }}>
-                Leave
-              </button>
+              <div style={{ display: 'flex', gap: '8px' }}>
+                <button onClick={leaveRoom} className="btn btn-secondary" style={{ width: 'auto', padding: '8px 16px', fontSize: '0.9rem' }}>
+                  Leave
+                </button>
+                <button onClick={() => { (async () => { await clearRoom() })() }} className="btn" style={{ background: 'var(--danger)', color: 'white', padding: '8px 16px', borderRadius: '8px', fontSize: '0.9rem' }}>
+                  Clear Room
+                </button>
+              </div>
             </div>
 
             <div style={{ marginBottom: '20px', padding: '12px', background: 'var(--background)', borderRadius: '8px' }}>

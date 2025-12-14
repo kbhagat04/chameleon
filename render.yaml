@@ -9,7 +9,7 @@ services:
     plan: starter
     repo: https://github.com/kbhagat04/chameleon
     branch: main
-    buildCommand: cd next-app && npm ci && npm run build
+    buildCommand: cd next-app && npm install && npm run build
     startCommand: cd next-app && npm run start
     envVars:
       - key: NEXT_PUBLIC_SUPABASE_URL
