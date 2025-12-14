@@ -1,0 +1,26 @@
+# Dependencies
+node_modules/
+package-lock.json
+yarn.lock
+
+# Next.js
+.next/
+out/
+.vercel
+
+# Environment
+.env.local
+.env*.local
+.env
+
+# OS
+.DS_Store
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+
+# Build artifacts
+dist/
+build/

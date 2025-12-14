@@ -1,0 +1,28 @@
+{
+  "name": "chameleon-game",
+  "version": "1.0.0",
+  "description": "A real-time multiplayer social deduction game built with Next.js and Supabase.",
+  "license": "MIT",
+  "private": true,
+  "engines": {
+    "node": ">=16.0.0"
+  },
+  "scripts": {
+    "dev": "cd next-app && npm run dev",
+    "build": "cd next-app && npm run build",
+    "start": "cd next-app && npm run start",
+    "install-deps": "npm install && cd next-app && npm install"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/yourusername/chameleon.git"
+  },
+  "keywords": [
+    "game",
+    "multiplayer",
+    "social-deduction",
+    "next.js",
+    "supabase",
+    "realtime"
+  ]
+}

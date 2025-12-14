@@ -1,0 +1,33 @@
+# Minimal Render manifest for the Chameleon Next.js app
+# Replace `repo` with your repository URL where needed, or let Render
+# create the service from the Dashboard and omit `repo`.
+
+services:
+  - type: web
+    name: chameleon-web
+    env: node
+    plan: starter
+    repo: https://github.com/<your-org>/<your-repo>
+    branch: main
+    buildCommand: npm ci && npm run build
+    startCommand: npm run start
+    envVars:
+      - key: NEXT_PUBLIC_SUPABASE_URL
+        sync: false
+      - key: NEXT_PUBLIC_SUPABASE_ANON_KEY
+        sync: false
+      - key: SUPABASE_SERVICE_KEY
+        sync: false
+
+  - type: cron
+    name: prune-stale-players
+    plan: starter
+    schedule: "0 * * * *" # hourly
+    command: node next-app/scripts/prune.js
+    envVars:
+      - key: SUPABASE_SERVICE_KEY
+        sync: false
+
+# Notes:
+# - Do NOT commit real secrets; set them in Render's dashboard as environment secrets.
+# - If you don't want a cron in the manifest, create a separate Render Cron job in the dashboard.
