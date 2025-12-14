@@ -7,7 +7,7 @@ services:
     name: chameleon-web
     env: node
     plan: starter
-    repo: https://github.com/<your-org>/<your-repo>
+    repo: https://github.com/kbhagat04/chameleon
     branch: main
     buildCommand: npm ci && npm run build
     startCommand: npm run start
