@@ -44,8 +44,8 @@
 }
 
 [data-theme="dark"] .modal-content {
-  background: linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0.01));
-  border: 1px solid rgba(255,255,255,0.06);
+  background: linear-gradient(180deg, rgba(17,21,43,0.95), rgba(10,14,26,0.92));
+  border: 1px solid rgba(167,139,250,0.15);
   box-shadow: 0 30px 60px -20px rgba(2,6,23,0.75);
 }
 

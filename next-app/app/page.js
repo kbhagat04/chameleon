@@ -62,12 +62,14 @@ export default function Home() {
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
   }, [confirmState.open])
-  const HEARTBEAT_INTERVAL = 15000 // 15s
-  const STALE_THRESHOLD = 60000 // 60s
+  // Activity-based heartbeat: only write lastSeen on action (no fixed interval)
+  const STALE_THRESHOLD = 120000 // 120s (longer since no regular heartbeat writes)
   const heartbeatRef = useRef(null)
   const myIdRef = useRef(null)
   const myJoinedAtRef = useRef(null)
   const lastHandledStartRef = useRef(0)
+  const lastPlayerCountRef = useRef(0)
+  const joinTimeRef = useRef(0)
   const [localPresence, setLocalPresence] = useState(false)
   const localPresenceRef = useRef(false)
   const [dark, setDark] = useState(false)
@@ -80,7 +82,11 @@ export default function Home() {
   const fetchPlayersForRoom = async (roomName) => {
     const normalized = normalizeRoom(roomName)
     try {
-      const { data } = await supabase.from('players').select('*').eq('room', normalized)
+      const { data, error } = await supabase.from('players').select('*').eq('room', normalized)
+      if (error) {
+        console.error('fetchPlayersForRoom error:', error)
+        return
+      }
       // filter out stale rows based on lastSeen to avoid showing disconnected tabs
       const now = Date.now()
       const filtered = (data || []).filter((r) => {
@@ -88,12 +94,12 @@ export default function Home() {
         const last = new Date(r.lastSeen).getTime()
         return (now - last) <= STALE_THRESHOLD
       })
+      console.log(`[fetchPlayersForRoom] room=${normalized}: fetched ${data.length} rows, filtered to ${filtered.length}`)
       setPlayers(filtered.map((r) => ({ id: r.id, name: r.name, lastSeen: r.lastSeen })))
     } catch (e) {
       console.error('fetchPlayersForRoom error', e)
     }
   }
-  fetchPlayersRef.current = fetchPlayersForRoom
   fetchPlayersRef.current = fetchPlayersForRoom
 
   // BroadcastChannel to sync room/id across tabs (if supported)
@@ -146,7 +152,7 @@ export default function Home() {
   const fetchRoomFor = async (roomName, overwriteCategory = false) => {
     const normalized = normalizeRoom(roomName)
     try {
-      const { data } = await supabase.from('rooms').select('payload').eq('room', normalized).limit(1).single()
+      const { data } = await supabase.from('rooms').select('payload').eq('room', normalized).maybeSingle()
       const payload = data?.payload || null
       if (!payload) return
       if (overwriteCategory) {
@@ -233,52 +239,97 @@ export default function Home() {
     if (!joined) return
 
     const normalizedRoom = normalizeRoom(room)
+    console.log(`[realtime] SUBSCRIBE to players for room: ${normalizedRoom}`)
 
     // initial fetch
     fetchPlayersForRoom(normalizedRoom)
 
     const channel = supabase.channel(`public:players:${normalizedRoom}`)
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'players', filter: `room=eq.${normalizedRoom}` }, async (payload) => {
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'players' }, async (payload) => {
+        // Filter by room in the callback instead of in the subscription filter
+        if (payload.new?.room !== normalizedRoom && payload.old?.room !== normalizedRoom) {
+          return
+        }
+        console.log(`[realtime] players event for room ${normalizedRoom}: ${payload.eventType}`, payload)
         // refresh authoritative list from DB
         await fetchPlayersForRoom(normalizedRoom)
       })
-      .subscribe()
+      .subscribe((status) => {
+        console.log(`[realtime] players channel status for room ${normalizedRoom}:`, status)
+      })
 
-    // fallback polling in case realtime events aren't delivered to all tabs
-    const pollInterval = 3000
-    const pollRef = setInterval(() => {
-      fetchPlayersForRoom(normalizedRoom)
-    }, pollInterval)
+    // Polling fallback: check every 5s in case Realtime DELETE events are unreliable
+    const pollInterval = setInterval(async () => {
+      try {
+        const { data } = await supabase.from('players').select('*').eq('room', normalizedRoom)
+        if (!data) return
+        const now = Date.now()
+        const filtered = (data || []).filter((r) => {
+          if (!r.lastSeen) return true
+          const last = new Date(r.lastSeen).getTime()
+          return (now - last) <= STALE_THRESHOLD
+        })
+        // Only update if count changed (to avoid unnecessary renders)
+        if (filtered.length !== players.length) {
+          console.log(`[poll] room ${normalizedRoom}: count changed from ${players.length} to ${filtered.length}`)
+          setPlayers(filtered.map((r) => ({ id: r.id, name: r.name, lastSeen: r.lastSeen })))
+        }
+      } catch (e) {
+        console.error('[poll] error', e)
+      }
+    }, 5000)
 
     // Subscribe to realtime changes on `rooms` for the normalized room
     const roomChannel = supabase.channel(`public:rooms:${normalizedRoom}`)
       .on('postgres_changes', { event: '*', schema: 'public', table: 'rooms', filter: `room=eq.${normalizedRoom}` }, async (payload) => {
+        console.log(`[realtime] rooms event for room ${normalizedRoom}: ${payload.eventType}`)
         // Always fetch and overwrite category/game state
         await fetchRoomRef.current && fetchRoomRef.current(normalizedRoom, true)
       })
-      .subscribe()
+      .subscribe((status) => {
+        console.log(`[realtime] rooms channel status for room ${normalizedRoom}:`, status)
+      })
 
-    // polling fallback for room payloads (still keep for reliability)
-    const roomPollInterval = 2000
-    const roomPollRef = setInterval(() => {
-      fetchRoomRef.current && fetchRoomRef.current(normalizedRoom, true)
-    }, roomPollInterval)
+    // (room payload polling removed — Realtime should be reliable)
 
     return () => {
+      console.log(`[realtime] UNSUBSCRIBE from players for room: ${normalizedRoom}`)
+      clearInterval(pollInterval)
       supabase.removeChannel(channel)
       supabase.removeChannel(roomChannel)
-      try { clearInterval(pollRef) } catch (e) {}
-      try { clearInterval(roomPollRef) } catch (e) {}
     }
   }, [joined, room])
 
-  // cleanup heartbeat and beforeunload listener on unmount
+  // Auto-leave when players list becomes empty (room cleared) — uses current state
   useEffect(() => {
-    return () => {
-      if (heartbeatRef.current) clearInterval(heartbeatRef.current)
-      try { window.removeEventListener('beforeunload', window._chameleon_remove_self) } catch (e) {}
+    if (!joined) return
+    
+    // Skip auto-leave for 3 seconds after joining (grace period)
+    const timeSinceJoin = Date.now() - joinTimeRef.current
+    if (timeSinceJoin < 3000) {
+      console.log(`[auto-leave] grace period active (${timeSinceJoin}ms)`)
+      lastPlayerCountRef.current = players.length
+      return
     }
-  }, [])
+    
+    // Always track the current player count
+    const currentCount = players.length
+    const previousCount = lastPlayerCountRef.current
+    
+    console.log(`[auto-leave] joined=${joined}, currentCount=${currentCount}, previousCount=${previousCount}`)
+    
+    // Only trigger auto-leave if we transition from non-empty to empty
+    if (currentCount === 0 && previousCount > 0) {
+      console.log(`[auto-leave] TRIGGERED: transitioning from ${previousCount} to 0`)
+      ;(async () => {
+        try { await showAlert('Room is now empty — returning to home.') } catch (e) {}
+        try { await leaveRoom() } catch (e) { console.error('auto-leave failed:', e) }
+      })()
+    }
+    
+    // Always update ref with current count for next comparison
+    lastPlayerCountRef.current = currentCount
+  }, [players, joined])
 
   async function join() {
     if (!name) {
@@ -298,6 +349,7 @@ export default function Home() {
     } catch (e) {}
     setRoom(normalizedRoom)
     setJoined(true)
+    joinTimeRef.current = Date.now()
     const now = Date.now()
     myJoinedAtRef.current = now
     try { localStorage.setItem('chameleon_joined_at', String(now)) } catch (e) {}
@@ -326,12 +378,11 @@ export default function Home() {
 
     // insert presence row into `players` table
     try {
-      const nowISO = new Date().toISOString()
-      const insRes = await supabase.from('players').upsert([{ id: myId, room: normalizedRoomKey, name }], { onConflict: 'id' }).select()
-      if (insRes.error) {
-        // Log the full response so we can diagnose empty error objects
-        console.error('insert presence error - full response:', insRes)
-        const e = insRes.error || {}
+      const { error: insError } = await supabase.from('players').upsert([{ id: myId, room: normalizedRoomKey, name }])
+      if (insError) {
+        // Log the error
+        console.error('insert presence error:', insError)
+        const e = insError || {}
         console.error('insert presence error (fields):', {
           message: e.message,
           details: e.details,
@@ -369,22 +420,6 @@ export default function Home() {
       console.error('fetch players after join failed', e)
     }
 
-    // start heartbeat to keep lastSeen updated (only if we successfully write presence)
-    try {
-      if (!localPresenceRef.current) {
-        if (heartbeatRef.current) clearInterval(heartbeatRef.current)
-        heartbeatRef.current = setInterval(async () => {
-          try {
-            await supabase.from('players').upsert([{ id: myId, room: normalizedRoomKey, name, lastSeen: new Date().toISOString() }], { onConflict: 'id' })
-          } catch (e) {
-            console.error('heartbeat upsert failed', e)
-          }
-        }, HEARTBEAT_INTERVAL)
-        // do an immediate heartbeat write as well
-        try { await supabase.from('players').upsert([{ id: myId, room: normalizedRoomKey, name, lastSeen: new Date().toISOString() }], { onConflict: 'id' }) } catch (e) {}
-      }
-    } catch (e) {}
-
     // remove player on tab close/unload
     const removeSelf = async () => {
       try {
@@ -420,7 +455,7 @@ export default function Home() {
       ;(async () => {
         try {
           // verify the players row exists for this id (helps when DB row already present)
-          const { data: playerRow, error } = await supabase.from('players').select('*').eq('id', storedId).limit(1).single()
+          const { data: playerRow, error } = await supabase.from('players').select('*').eq('id', storedId).maybeSingle()
           if (error) {
             // if there's an error, just bail — user can re-join manually
             return
@@ -441,24 +476,12 @@ export default function Home() {
             }
             window._chameleon_remove_self = removeSelf
             try { window.addEventListener('beforeunload', removeSelf) } catch (e) {}
-            // upsert presence row to refresh lastSeen/name/room in DB
+            // upsert presence row to refresh name/room in DB
             try {
-              await supabase.from('players').upsert([{ id: storedId, room: normalizeRoom(storedRoom), name: storedName || playerRow.name }], { onConflict: 'id' })
+              await supabase.from('players').upsert([{ id: storedId, room: normalizeRoom(storedRoom), name: storedName || playerRow.name }])
             } catch (e) {
               console.error('restore upsert presence failed', e)
             }
-              // start heartbeat for restored session
-              try {
-                if (!localPresenceRef.current) {
-                  if (heartbeatRef.current) clearInterval(heartbeatRef.current)
-                  heartbeatRef.current = setInterval(async () => {
-                    try {
-                      await supabase.from('players').upsert([{ id: storedId, room: normalizeRoom(storedRoom), name: storedName || playerRow.name, lastSeen: new Date().toISOString() }], { onConflict: 'id' })
-                    } catch (e) { console.error('restore heartbeat upsert failed', e) }
-                  }, HEARTBEAT_INTERVAL)
-                  try { await supabase.from('players').upsert([{ id: storedId, room: normalizeRoom(storedRoom), name: storedName || playerRow.name, lastSeen: new Date().toISOString() }], { onConflict: 'id' }) } catch (e) {}
-                }
-              } catch (e) {}
           }
         } catch (e) {
           console.error('session restore failed', e)
@@ -484,7 +507,7 @@ export default function Home() {
     let payloadCustomWords = customWords
     if (category === 'Custom') {
       try {
-        const { data: roomRow } = await supabase.from('rooms').select('payload').eq('room', normalizeRoom(room)).limit(1).single()
+        const { data: roomRow } = await supabase.from('rooms').select('payload').eq('room', normalizeRoom(room)).maybeSingle()
         payloadCustomWords = roomRow?.payload?.customWords || customWords
       } catch (e) {}
     }
@@ -494,17 +517,26 @@ export default function Home() {
     const normalizedRoom = normalizeRoom(room)
     let existingPayload = {}
     try {
-      const { data: roomRow } = await supabase.from('rooms').select('payload').eq('room', normalizedRoom).limit(1).single()
+      const { data: roomRow } = await supabase.from('rooms').select('payload').eq('room', normalizedRoom).maybeSingle()
       existingPayload = roomRow?.payload || {}
     } catch (e) {
       // ignore - row may not exist yet
     }
     const payload = { ...existingPayload, players, chameleon: chId, secretWord: word, category: category || existingPayload.category || null, startedAt: Date.now() }
     if (category === 'Custom') payload.customWords = payloadCustomWords
-    await supabase.from('rooms').upsert({ room: normalizedRoom, payload }, { onConflict: 'room' })
+    await supabase.from('rooms').upsert({ room: normalizedRoom, payload })
+
+    // Activity-based lastSeen update: write when game starts
+    const myIdLocal = myIdRef.current || (() => { try { return localStorage.getItem('chameleon_player_id') } catch (e) { return null } })()
+    try {
+      if (!localPresenceRef.current && myIdLocal) {
+        await supabase.from('players').upsert([{ id: myIdLocal, room: normalizedRoom }])
+      }
+    } catch (e) {
+      console.error('activity-based startGame lastSeen update failed', e)
+    }
 
     // locally set role and secret for current player using stored id
-    const myIdLocal = myIdRef.current || (() => { try { return localStorage.getItem('chameleon_player_id') } catch (e) { return null } })()
     const me = players.find((p) => p.id === myIdLocal) || players.find((p) => p.name === name)
     if (me) {
       setRole(me.id === chId ? 'Chameleon' : 'Player')
@@ -513,15 +545,13 @@ export default function Home() {
   }
 
   async function leaveRoom() {
-    // stop heartbeat
-    try { if (heartbeatRef.current) { clearInterval(heartbeatRef.current); heartbeatRef.current = null } } catch (e) {}
     // remove this player's presence and reset local state
     const myId = myIdRef.current || (() => { try { return localStorage.getItem('chameleon_player_id') } catch (e) { return null } })()
     try {
       if (!localPresenceRef.current && myId) {
-        const delRes = await supabase.from('players').delete().eq('id', myId).select()
-        if (delRes.error) {
-          console.error('leaveRoom: error removing player - response:', delRes)
+        const { error: delError } = await supabase.from('players').delete().eq('id', myId)
+        if (delError) {
+          console.error('leaveRoom: error removing player:', delError)
         } else {
           // update local UI immediately
           setPlayers((prev) => prev.filter((p) => p.id !== myId))
@@ -559,17 +589,19 @@ export default function Home() {
 
   // Clear the current room: remove all player rows and reset the room payload.
   async function clearRoom() {
-    const ok = await showConfirm(`Clear room "${room}"? This will remove all players and reset the room.`, 'Clear', 'Cancel')
+    const ok = await showConfirm(`Clear room "${room}"? Please notify other players to leave first.`, 'OK', 'Cancel')
     if (!ok) return
     const normalizedRoom = normalizeRoom(room)
     try {
       // delete all players in the room
-      const delPlayers = await supabase.from('players').delete().eq('room', normalizedRoom)
-      if (delPlayers.error) {
-        console.error('clearRoom: delete players error', delPlayers)
+      console.log(`[clearRoom] deleting all players in room: ${normalizedRoom}`)
+      const { error: delPlayersError } = await supabase.from('players').delete().eq('room', normalizedRoom)
+      if (delPlayersError) {
+        console.error('clearRoom: delete players error', delPlayersError)
         await showAlert('Failed to clear players for the room.')
         return
       }
+      console.log(`[clearRoom] successfully deleted players`)
       // delete the room payload as well
       const delRoom = await supabase.from('rooms').delete().eq('room', normalizedRoom)
       if (delRoom.error) {
@@ -584,7 +616,7 @@ export default function Home() {
       } catch (e) {}
 
       // local UI: notify and leave
-      try { await showAlert('Room cleared — returning to home.') } catch (e) {}
+      try { await showAlert('Room cleared.') } catch (e) {}
       try { leaveRoom() } catch (e) {}
     } catch (e) {
       console.error('clearRoom exception', e)
@@ -611,7 +643,7 @@ export default function Home() {
     const normalizedRoom = normalizeRoom(room)
     try {
       // fetch existing payload to avoid clobbering other fields
-      const { data: roomRow } = await supabase.from('rooms').select('payload').eq('room', normalizedRoom).limit(1).single()
+      const { data: roomRow } = await supabase.from('rooms').select('payload').eq('room', normalizedRoom).maybeSingle()
       const existing = roomRow?.payload || {}
       // If custom, sync customWords to payload
       let newPayload = { ...existing, category: newCategory }
@@ -620,12 +652,23 @@ export default function Home() {
       } else {
         if (newPayload.customWords) delete newPayload.customWords
       }
-      const upsertRes = await supabase.from('rooms').upsert({ room: normalizedRoom, payload: newPayload }, { onConflict: 'room' }).select()
-      if (upsertRes.error) {
+      const upsertRes = await supabase.from('rooms').upsert({ room: normalizedRoom, payload: newPayload })
+      if (!upsertRes) {
         console.error('updateRoomCategory: upsert error', upsertRes.error)
         await showAlert('Failed to set category')
         return
       }
+
+      // Activity-based lastSeen update: write when category changes
+      try {
+        const myIdLocal = myIdRef.current || (() => { try { return localStorage.getItem('chameleon_player_id') } catch (e) { return null } })()
+        if (!localPresenceRef.current && myIdLocal) {
+          await supabase.from('players').upsert([{ id: myIdLocal, room: normalizedRoom }])
+        }
+      } catch (e) {
+        console.error('activity-based category lastSeen update failed', e)
+      }
+
       // locally update so UI is responsive (Realtime will also sync)
       setCategory(newCategory)
       // broadcast to other tabs as an immediate hint

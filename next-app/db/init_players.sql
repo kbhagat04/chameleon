@@ -6,8 +6,9 @@ CREATE TABLE IF NOT EXISTS public.players (
   lastSeen timestamptz DEFAULT now()
 );
 
--- Optional index for faster lookups by room
+-- Indexes for efficient queries (room lookups, lastSeen filtering for prune)
 CREATE INDEX IF NOT EXISTS players_room_idx ON public.players (room);
+CREATE INDEX IF NOT EXISTS players_last_seen_idx ON public.players (lastSeen);
 
 -- Enable Row Level Security (RLS). By default this file enables RLS and
 -- includes a permissive development policy so the app keeps working while
